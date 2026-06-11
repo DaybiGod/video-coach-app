@@ -1,0 +1,91 @@
+# Compila la app iOS SIN Mac y SIN cuenta Apple de pago:
+# runner macOS de GitHub -> IPA sin firmar -> instalar con Sideloadly en Windows.
+name: Build iOS (sin firma)
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'release o dev-client'
+        required: false
+        default: 'release'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+
+jobs:
+  build-ios:
+    runs-on: macos-26 # NO usar macos-latest: puede cambiar bajo tus pies
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fijar Xcode (la mas nueva 26.x estable del runner)
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          xcodebuild -version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+        env:
+          EXPO_NO_TELEMETRY: '1'
+
+      - name: Expo prebuild (genera ios/)
+        run: npx expo prebuild --platform ios --no-install
+        env:
+          EXPO_NO_TELEMETRY: '1'
+          CI: '1'
+
+      - name: Cache de CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: pods-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Pod install
+        run: pod install --project-directory=ios
+
+      - name: Detectar workspace y scheme
+        id: xc
+        run: |
+          WS=$(ls -d ios/*.xcworkspace | head -1)
+          SCHEME=$(basename "$(ls -d ios/*.xcodeproj | head -1)" .xcodeproj)
+          echo "workspace=$WS" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Workspace: $WS | Scheme: $SCHEME"
+
+      - name: Compilar sin firma
+        run: |
+          CONFIG=Release
+          if [ "${{ github.event.inputs.profile }}" = "dev-client" ]; then CONFIG=Debug; fi
+          xcodebuild build \
+            -workspace "${{ steps.xc.outputs.workspace }}" \
+            -scheme "${{ steps.xc.outputs.scheme }}" \
+            -configuration "$CONFIG" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Empaquetar .ipa (Payload/*.app -> zip)
+        run: |
+          CONFIG=Release
+          if [ "${{ github.event.inputs.profile }}" = "dev-client" ]; then CONFIG=Debug; fi
+          APP=$(ls -d build/Build/Products/${CONFIG}-iphoneos/*.app | head -1)
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry "VideoCoachCam-${CONFIG}.ipa" Payload
+          ls -la *.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VideoCoachCam-${{ github.event.inputs.profile || 'release' }}
+          path: '*.ipa'
+          retention-days: 14
