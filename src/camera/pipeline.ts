@@ -1,123 +1,70 @@
 /**
- * Stream en vivo hacia la PC: frame output pequeno en RGB -> JPEG (nitro-image) -> TCP.
+ * Stream en vivo hacia la PC mediante snapshots del preview (camino robusto).
  *
- * El worklet SOLO copia el buffer y lo programa hacia el hilo JS (scheduleOnRN);
- * el gate de fps, el encode y el envio viven en JS. El backpressure real lo hace
- * SendQueue (slot de 1 frame): si la red va lenta los frames viejos se descartan.
+ * NO usa frame processors ni Images.loadFromRawPixelData: ese camino crasheaba
+ * de forma nativa en nitro-image (ArrayBufferHolder.asOwning / UIImage.init
+ * fromRawPixelData -> EXC_BREAKPOINT). En su lugar, un bucle en el hilo JS toma
+ * `camera.takeSnapshot()` (Image nativa lista), la reduce y la codifica a JPEG.
+ * Auto-regulado: el siguiente tick solo se programa cuando el anterior termino.
  */
-import { useMemo, useRef } from 'react';
-import { Images } from 'react-native-nitro-image';
-import { useFrameOutput } from 'react-native-vision-camera';
-import { scheduleOnRN } from 'react-native-worklets';
-
-type ImagePixelFormat = Parameters<typeof Images.loadFromRawPixelData>[0]['pixelFormat'];
+import { useEffect, useRef } from 'react';
+import type { CameraRef } from 'react-native-vision-camera';
 
 import { STREAM_DEFAULTS } from '../config/constants';
 import type { TcpCoachServer } from '../net/TcpCoachServer';
 import { useAppStore } from '../state/appStore';
 
-interface FramePacket {
-  pixels: ArrayBuffer;
-  width: number;
-  height: number;
-  bytesPerRow: number;
-  pixelFormat: string;
-  tsMs: number;
-}
+type ImageLike = {
+  resizeAsync(w: number, h: number): Promise<ImageLike>;
+  toEncodedImageDataAsync(format: string, quality?: number): Promise<{ buffer: ArrayBuffer }>;
+  dispose?: () => void;
+};
 
-function mapFormat(cameraFormat: string): { format: ImagePixelFormat; bpp: number } | null {
-  switch (cameraFormat) {
-    case 'rgb-bgra-8-bit':
-      return { format: 'BGRA', bpp: 4 };
-    case 'rgb-rgba-8-bit':
-      return { format: 'RGBA', bpp: 4 };
-    case 'rgb-rgb-8-bit':
-      return { format: 'RGB', bpp: 3 };
-    default:
-      return null;
-  }
-}
+export function useLiveStream(
+  server: TcpCoachServer,
+  cameraRef: React.RefObject<CameraRef | null>,
+) {
+  const sentRef = useRef(0);
 
-/** RawPixelData exige filas compactas; los buffers de camara pueden traer padding. */
-function tighten(
-  pixels: ArrayBuffer,
-  width: number,
-  height: number,
-  bytesPerRow: number,
-  bpp: number,
-): ArrayBuffer {
-  const rowBytes = width * bpp;
-  if (bytesPerRow === rowBytes) return pixels;
-  const src = new Uint8Array(pixels);
-  const dst = new Uint8Array(rowBytes * height);
-  for (let y = 0; y < height; y += 1) {
-    dst.set(src.subarray(y * bytesPerRow, y * bytesPerRow + rowBytes), y * rowBytes);
-  }
-  return dst.buffer;
-}
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-export function useLiveStream(server: TcpCoachServer) {
-  const lastSentAt = useRef(0);
-  const sentCounter = useRef(0);
-
-  const processFrame = useMemo(() => {
-    return (packet: FramePacket): void => {
-      void (async () => {
-        const { streamOn, maxFps, jpegQuality } = useAppStore.getState();
-        if (!streamOn || !server.hasClient) return;
-        const now = Date.now();
-        if (now - lastSentAt.current < 1000 / Math.max(1, maxFps)) return;
-        lastSentAt.current = now;
-        const mapped = mapFormat(packet.pixelFormat);
-        if (mapped === null) return;
+    const tick = async () => {
+      if (stopped) return;
+      const { streamOn, maxFps } = useAppStore.getState();
+      const cam = cameraRef.current;
+      if (cam && streamOn && server.hasClient) {
         try {
-          const tight = tighten(
-            packet.pixels, packet.width, packet.height, packet.bytesPerRow, mapped.bpp);
-          const image = Images.loadFromRawPixelData({
-            buffer: tight,
-            width: packet.width,
-            height: packet.height,
-            pixelFormat: mapped.format,
-          });
-          const encoded = await image.toEncodedImageDataAsync('jpg', jpegQuality);
-          if (server.sendFrame(packet.tsMs, new Uint8Array(encoded.buffer))) {
-            sentCounter.current += 1;
-          }
+          const jpegQuality = useAppStore.getState().jpegQuality; // 0-100
+          const snap = (await cam.takeSnapshot()) as unknown as ImageLike;
+          const small = await snap.resizeAsync(STREAM_DEFAULTS.width, STREAM_DEFAULTS.height);
+          const enc = await small.toEncodedImageDataAsync('jpg', jpegQuality);
+          server.sendFrame(Date.now(), new Uint8Array(enc.buffer));
+          sentRef.current += 1;
+          snap.dispose?.();
+          small.dispose?.();
         } catch {
-          // un frame fallido no es fatal: el siguiente lo reemplaza
+          // preview no listo todavia, o snapshot fallo: saltar este tick
         }
-      })();
-    };
-  }, [server]);
-
-  const frameOutput = useFrameOutput({
-    targetResolution: { width: STREAM_DEFAULTS.width, height: STREAM_DEFAULTS.height },
-    pixelFormat: 'rgb',
-    dropFramesWhileBusy: true,
-    onFrame(frame) {
-      'worklet';
-      try {
-        const copy = frame.getPixelBuffer().slice(0);
-        const packet: FramePacket = {
-          pixels: copy,
-          width: frame.width,
-          height: frame.height,
-          bytesPerRow: frame.bytesPerRow,
-          pixelFormat: frame.pixelFormat,
-          tsMs: Date.now(),
-        };
-        scheduleOnRN(processFrame, packet);
-      } finally {
-        frame.dispose();
       }
-    },
-  });
+      if (stopped) return;
+      const fps = Math.max(1, Math.min(30, useAppStore.getState().maxFps));
+      timer = setTimeout(tick, Math.round(1000 / fps));
+    };
+
+    timer = setTimeout(tick, 600); // pequeña espera a que el preview arranque
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [server, cameraRef]);
 
   const takeSentCount = (): number => {
-    const n = sentCounter.current;
-    sentCounter.current = 0;
+    const n = sentRef.current;
+    sentRef.current = 0;
     return n;
   };
 
-  return { frameOutput, takeSentCount };
+  return { takeSentCount };
 }

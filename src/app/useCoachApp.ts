@@ -11,6 +11,7 @@ import {
   VisionCamera,
   useVideoOutput,
   type CameraOutput,
+  type CameraRef,
 } from 'react-native-vision-camera';
 
 import { RecordingController } from '../camera/recording';
@@ -52,7 +53,9 @@ export function useCoachApp() {
   const videoOutputRef = useRef(videoOutput);
   videoOutputRef.current = videoOutput;
 
-  const { frameOutput, takeSentCount } = useLiveStream(server);
+  // ref a la camara para tomar snapshots del preview (camino del stream en vivo)
+  const cameraRef = useRef<CameraRef | null>(null);
+  const { takeSentCount } = useLiveStream(server, cameraRef);
 
   const fileSender = useMemo(() => new FileSender(server), [server]);
   const batteryRef = useRef<number | null>(null);
@@ -224,9 +227,10 @@ export function useCoachApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [server]);
 
+  // Solo el output de video 4K; el stream en vivo usa takeSnapshot del preview.
   const outputs: CameraOutput[] = useMemo(
-    () => [videoOutput, frameOutput].filter(Boolean) as CameraOutput[],
-    [videoOutput, frameOutput],
+    () => [videoOutput].filter(Boolean) as CameraOutput[],
+    [videoOutput],
   );
 
   const toggleRecording = async (): Promise<void> => {
@@ -234,5 +238,5 @@ export function useCoachApp() {
     else await recorder.start();
   };
 
-  return { granted, outputs, toggleRecording };
+  return { granted, outputs, toggleRecording, cameraRef };
 }

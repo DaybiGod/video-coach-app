@@ -13,7 +13,7 @@ import { useAppStore } from '../state/appStore';
 export default function MainScreen(): React.JSX.Element {
   useKeepAwake();
   const device = useCameraDevice('back');
-  const { granted, outputs, toggleRecording } = useCoachApp();
+  const { granted, outputs, toggleRecording, cameraRef } = useCoachApp();
   const clientConnected = useAppStore((s) => s.clientConnected);
   const lastError = useAppStore((s) => s.lastError);
 
@@ -22,6 +22,7 @@ export default function MainScreen(): React.JSX.Element {
       <StatusBar style="light" />
       {granted && device ? (
         <Camera
+          ref={cameraRef}
           style={StyleSheet.absoluteFill}
           device={device}
           isActive={true}
