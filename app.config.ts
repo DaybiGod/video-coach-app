@@ -6,6 +6,8 @@ const config: ExpoConfig = {
   version: '0.1.0',
   orientation: 'portrait',
   userInterfaceStyle: 'dark',
+  // Nota: VisionCamera v5 (Nitro) EXIGE New Architecture. En SDK 56 ya esta SIEMPRE
+  // activa (el flag newArchEnabled se elimino del tipo), por eso no se declara aqui.
   ios: {
     // NO cambiar nunca: el Apple ID gratis limita a 10 App IDs nuevos por semana.
     bundleIdentifier: 'com.cesar.videocoachcam',

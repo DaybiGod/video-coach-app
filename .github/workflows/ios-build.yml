@@ -42,6 +42,11 @@ jobs:
           EXPO_NO_TELEMETRY: '1'
           CI: '1'
 
+      - name: Hornear ruta absoluta de node (blinda la fase "Bundle RN")
+        run: |
+          echo "export NODE_BINARY=$(command -v node)" > ios/.xcode.env.local
+          cat ios/.xcode.env.local
+
       - name: Cache de CocoaPods
         uses: actions/cache@v4
         with:
@@ -53,14 +58,20 @@ jobs:
       - name: Pod install
         run: pod install --project-directory=ios
 
-      - name: Detectar workspace y scheme
+      - name: Detectar y validar workspace y scheme
         id: xc
         run: |
           WS=$(ls -d ios/*.xcworkspace | head -1)
           SCHEME=$(basename "$(ls -d ios/*.xcodeproj | head -1)" .xcodeproj)
+          echo "Workspace: $WS | Scheme detectado: $SCHEME"
+          # Falla rapido y claro si el scheme no existe (en vez de un error opaco de xcodebuild)
+          if ! xcodebuild -list -workspace "$WS" | grep -qw "$SCHEME"; then
+            echo "::error::El scheme '$SCHEME' no aparece en el workspace. Schemes disponibles:"
+            xcodebuild -list -workspace "$WS" || true
+            exit 1
+          fi
           echo "workspace=$WS" >> "$GITHUB_OUTPUT"
           echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
-          echo "Workspace: $WS | Scheme: $SCHEME"
 
       - name: Compilar sin firma
         run: |
@@ -78,7 +89,23 @@ jobs:
         run: |
           CONFIG=Release
           if [ "${{ github.event.inputs.profile }}" = "dev-client" ]; then CONFIG=Debug; fi
-          APP=$(ls -d build/Build/Products/${CONFIG}-iphoneos/*.app | head -1)
+          APP=$(ls -d build/Build/Products/${CONFIG}-iphoneos/*.app 2>/dev/null | head -1)
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "::error::No se genero ningun .app en ${CONFIG}-iphoneos. Contenido de Products:"
+            ls -laR build/Build/Products 2>/dev/null || true
+            exit 1
+          fi
+          echo "App: $APP"
+          # Diagnostico (NO gate): con enlazado estatico puede no haber Frameworks/, y es correcto.
+          echo "--- Contenido del .app (nivel 1) ---"; ls -la "$APP"
+          if [ -d "$APP/Frameworks" ]; then
+            echo "--- Frameworks embebidos ---"; ls -la "$APP/Frameworks"
+          else
+            echo "Sin carpeta Frameworks/ (enlazado estatico: normal)."
+          fi
+          # El binario principal debe existir y ser Mach-O
+          BIN="$APP/$(basename "$APP" .app)"
+          file "$BIN" || true
           mkdir Payload
           cp -R "$APP" Payload/
           zip -qry "VideoCoachCam-${CONFIG}.ipa" Payload
