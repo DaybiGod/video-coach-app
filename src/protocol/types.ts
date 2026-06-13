@@ -77,6 +77,7 @@ export interface StatsMsg {
   mic_level_db: number | null;
   rec: { recording: boolean; elapsed_s: number };
   free_disk_mb: number | null;
+  stream_diag?: { ref: boolean; step: string; err: string | null }; // diagnostico temporal del stream
 }
 
 export interface StreamCtlMsg {

@@ -55,7 +55,9 @@ export function useCoachApp() {
 
   // ref a la camara para tomar snapshots del preview (camino del stream en vivo)
   const cameraRef = useRef<CameraRef | null>(null);
-  const { takeSentCount } = useLiveStream(server, cameraRef);
+  const { takeSentCount, getDiag } = useLiveStream(server, cameraRef);
+  const getDiagRef = useRef(getDiag);
+  getDiagRef.current = getDiag;
 
   const fileSender = useMemo(() => new FileSender(server), [server]);
   const batteryRef = useRef<number | null>(null);
@@ -203,6 +205,7 @@ export function useCoachApp() {
           elapsed_s: recStartedAt ? Math.round((Date.now() - recStartedAt) / 1000) : 0,
         },
         free_disk_mb: null,
+        stream_diag: getDiagRef.current(), // temporal: por que no salen frames
       });
     }, STATS_INTERVAL_MS);
 
