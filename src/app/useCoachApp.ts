@@ -15,8 +15,13 @@ import {
 
 import { RecordingController } from '../camera/recording';
 import { useLiveStream } from '../camera/pipeline';
-import { RECORDING_DEFAULTS, STATS_INTERVAL_MS, STORAGE_KEYS } from '../config/constants';
-import { FileSender, loadPending, type PendingFile } from '../net/FileSender';
+import {
+  MAX_DELIVER_ATTEMPTS,
+  RECORDING_DEFAULTS,
+  STATS_INTERVAL_MS,
+  STORAGE_KEYS,
+} from '../config/constants';
+import { FileSender, loadPending, savePending, type PendingFile } from '../net/FileSender';
 import { TcpCoachServer, type ServerHandlers } from '../net/TcpCoachServer';
 import { ERR, MsgType } from '../protocol/types';
 import { useAppStore } from '../state/appStore';
@@ -73,22 +78,37 @@ export function useCoachApp() {
         store.set({ recPhase: 'inactivo' });
         return;
       }
+      // Tope de reintentos: el contador se persiste ANTES de la entrega, asi un
+      // eventual crash igual consume un intento y el tope rompe cualquier bucle.
+      const attempts = (pending.attempts ?? 0) + 1;
+      if (attempts > MAX_DELIVER_ATTEMPTS) {
+        await savePending(null); // el .mp4 queda en disco para entrega manual
+        store.set({
+          recPhase: 'inactivo',
+          deliverPct: 0,
+          lastError: `entrega fallida tras ${pending.attempts} intentos; archivo conservado en el telefono`,
+        });
+        return;
+      }
+      const tried: PendingFile = { ...pending, attempts };
+      await savePending(tried);
       store.set({ recPhase: 'entregando', deliverPct: 0 });
       try {
-        const ok = await fileSender.deliver(pending, (pct) =>
+        const ok = await fileSender.deliver(tried, (pct) =>
           useAppStore.getState().set({ deliverPct: pct }),
         );
+        // en exito, FileSender.deliver ya hizo savePending(null) + delete
         useAppStore.getState().set({
           recPhase: 'inactivo',
           deliverPct: 0,
           lastError: ok ? null : 'la PC rechazo el archivo (sha256)',
         });
       } catch (e) {
-        // corte de conexion: el pendiente persiste y se reintenta al reconectar
+        // corte de conexion: el pendiente (con attempts ya incrementado) persiste
         useAppStore.getState().set({
           recPhase: 'inactivo',
           deliverPct: 0,
-          lastError: `entrega interrumpida: ${e instanceof Error ? e.message : e}`,
+          lastError: `entrega interrumpida (intento ${attempts}): ${e instanceof Error ? e.message : e}`,
         });
       }
     };
@@ -96,6 +116,7 @@ export function useCoachApp() {
 
     impl.current = {
       onClientChange: (connected, address) => {
+        if (!connected) fileSender.abortInflight('cliente desconectado');
         useAppStore.getState().set({
           clientConnected: connected,
           clientAddress: address ?? null,
@@ -124,8 +145,14 @@ export function useCoachApp() {
       onFileResult: fileSender.onFileResult,
       onAuthed: () => {
         void (async () => {
-          const pending = await loadPending();
-          if (pending && !fileSender.sending) await deliver(pending);
+          try {
+            const pending = await loadPending();
+            if (pending && !fileSender.sending) await deliver(pending);
+          } catch (e) {
+            useAppStore.getState().set({
+              lastError: `onAuthed: ${e instanceof Error ? e.message : String(e)}`,
+            });
+          }
         })();
       },
     };

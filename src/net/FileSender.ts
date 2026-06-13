@@ -18,10 +18,11 @@ import type { TcpCoachServer } from './TcpCoachServer';
 
 export interface PendingFile {
   fileId: string;
-  path: string; // uri file:// dentro de Documents
+  path: string; // ruta de sistema dentro de Documents
   name: string;
   size: number;
   sha256: string;
+  attempts?: number; // intentos de entrega ya consumidos (tope anti-bucle)
 }
 
 export async function loadPending(): Promise<PendingFile | null> {
@@ -30,11 +31,14 @@ export async function loadPending(): Promise<PendingFile | null> {
   try {
     const p = JSON.parse(raw) as PendingFile;
     if (!new File(p.path).exists) {
+      // el archivo ya no existe (o ruta invalida): descartar el pendiente, no reintentar
       await AsyncStorage.removeItem(STORAGE_KEYS.pendingFile);
       return null;
     }
     return p;
   } catch {
+    // pendiente corrupto o ruta que lanza: limpiarlo para no quedar atascado
+    await AsyncStorage.removeItem(STORAGE_KEYS.pendingFile).catch(() => {});
     return null;
   }
 }
@@ -72,7 +76,9 @@ export async function hashFile(
 
 export class FileSender {
   private acceptResolve: ((msg: FileAcceptMsg) => void) | null = null;
+  private acceptReject: ((err: Error) => void) | null = null;
   private resultResolve: ((msg: FileResultMsg) => void) | null = null;
+  private resultReject: ((err: Error) => void) | null = null;
   sending = false;
 
   constructor(private server: TcpCoachServer) {}
@@ -81,12 +87,22 @@ export class FileSender {
   onFileAccept = (msg: FileAcceptMsg): void => {
     this.acceptResolve?.(msg);
     this.acceptResolve = null;
+    this.acceptReject = null;
   };
 
   onFileResult = (msg: FileResultMsg): void => {
     this.resultResolve?.(msg);
     this.resultResolve = null;
+    this.resultReject = null;
   };
+
+  /** Corta cualquier espera pendiente (al perderse la conexion) para no colgar deliver(). */
+  abortInflight(reason = 'conexion perdida'): void {
+    this.acceptReject?.(new Error(reason));
+    this.resultReject?.(new Error(reason));
+    this.acceptResolve = this.acceptReject = null;
+    this.resultResolve = this.resultReject = null;
+  }
 
   /**
    * Envia el archivo pendiente. Devuelve true si la PC confirmo FILE_RESULT ok
@@ -141,20 +157,34 @@ export class FileSender {
 
   private waitAccept(timeoutMs: number): Promise<FileAcceptMsg> {
     return new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('timeout esperando FILE_ACCEPT')), timeoutMs);
+      const t = setTimeout(() => {
+        this.acceptResolve = this.acceptReject = null;
+        reject(new Error('timeout esperando FILE_ACCEPT'));
+      }, timeoutMs);
       this.acceptResolve = (msg) => {
         clearTimeout(t);
         resolve(msg);
+      };
+      this.acceptReject = (err) => {
+        clearTimeout(t);
+        reject(err);
       };
     });
   }
 
   private waitResult(timeoutMs: number): Promise<FileResultMsg> {
     return new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('timeout esperando FILE_RESULT')), timeoutMs);
+      const t = setTimeout(() => {
+        this.resultResolve = this.resultReject = null;
+        reject(new Error('timeout esperando FILE_RESULT'));
+      }, timeoutMs);
       this.resultResolve = (msg) => {
         clearTimeout(t);
         resolve(msg);
+      };
+      this.resultReject = (err) => {
+        clearTimeout(t);
+        reject(err);
       };
     });
   }

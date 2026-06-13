@@ -135,7 +135,18 @@ export class TcpCoachServer {
 
     const fail = (code: string, msg: string, close = false) => {
       queue.pushControl(encodeJson(MsgType.ERROR, { code, msg }));
-      if (close) setTimeout(() => socket.destroy(), 150);
+      if (close) {
+        // cierra la cola YA: ningun STATS/FRAME/FILE_END debe escribir durante
+        // la ventana hasta el destroy (evita el throw 'Socket is closed').
+        setTimeout(() => {
+          queue.close();
+          try {
+            socket.destroy();
+          } catch {
+            /* ya cerrado */
+          }
+        }, 150);
+      }
     };
 
     socket.on('data', (data?: unknown) => {
@@ -234,9 +245,11 @@ export class TcpCoachServer {
 
   private promote(socket: ServerSocket, queue: SendQueue): void {
     const old = this.active;
+    const oldQueue = this.queue;
     this.active = socket;
     this.queue = queue;
     if (old && old !== socket) {
+      oldQueue?.close(); // cierra la cola vieja antes de destruir su socket
       try {
         old.destroy();
       } catch {
@@ -262,6 +275,7 @@ export class TcpCoachServer {
 
   private dropActive(): void {
     if (this.active) {
+      this.queue?.close(); // cierra la cola antes de destruir el socket
       try {
         this.active.destroy();
       } catch {

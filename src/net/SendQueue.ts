@@ -4,6 +4,11 @@
  * - FRAME es un slot de 1: si la red va lenta, se sobrescribe (drop) y la
  *   latencia queda acotada,
  * - FILE_CHUNK se envia con await (el remitente espera el drain natural).
+ *
+ * CRITICO: react-native-tcp-socket lanza `throw 'Socket is closed.'` de forma
+ * SINCRONA al escribir sobre un socket destruido (incluido desde el callback
+ * nativo 'written'). En build Release esa excepcion no atrapada cierra la app.
+ * Por eso TODA escritura va envuelta en try/catch y un throw se trata como cierre.
  */
 import { Buffer } from 'buffer';
 
@@ -24,6 +29,7 @@ export class SendQueue {
   private bytesInFlight = 0;
   private writing = false;
   private closed = false;
+  private pendingChunkRejects = new Set<(err: Error) => void>();
   framesDropped = 0;
 
   constructor(private socket: WritableSocket) {}
@@ -55,20 +61,46 @@ export class SendQueue {
         reject(new Error('socket cerrado'));
         return;
       }
-      this.bytesInFlight += data.length;
-      this.socket.write(Buffer.from(data), undefined, (err?: Error | null) => {
-        this.bytesInFlight -= data.length;
+      const len = data.length;
+      this.bytesInFlight += len;
+      let settled = false;
+      const finish = (err?: Error | null) => {
+        if (settled) return;
+        settled = true;
+        this.pendingChunkRejects.delete(rejectFn);
+        this.bytesInFlight -= len;
         if (err) reject(err);
         else resolve();
-        this.pump();
-      });
+        if (!this.closed) this.pump();
+      };
+      const rejectFn = (err: Error) => finish(err);
+      this.pendingChunkRejects.add(rejectFn);
+      try {
+        this.socket.write(Buffer.from(data), undefined, (err?: Error | null) => finish(err));
+      } catch (e) {
+        // write() lanzo sincronicamente (socket destruido) -> cierre controlado, nunca crash
+        this.close();
+        finish(e instanceof Error ? e : new Error(String(e)));
+      }
     });
   }
 
   close(): void {
+    if (this.closed) return;
     this.closed = true;
+    this.writing = false;
     this.control = [];
     this.frameSlot = null;
+    // rechaza los chunks en vuelo para que deliver() falle rapido (no cuelga 60s)
+    const rejects = [...this.pendingChunkRejects];
+    this.pendingChunkRejects.clear();
+    for (const r of rejects) {
+      try {
+        r(new Error('socket cerrado'));
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   private pump(): void {
@@ -77,11 +109,19 @@ export class SendQueue {
     if (next === null) return;
     this.writing = true;
     this.bytesInFlight += next.length;
-    this.socket.write(Buffer.from(next), undefined, () => {
+    try {
+      this.socket.write(Buffer.from(next), undefined, () => {
+        this.bytesInFlight -= next.length;
+        this.writing = false;
+        this.pump();
+      });
+    } catch (e) {
+      // write() lanzo sincronicamente sobre socket destruido -> tratar como cierre.
+      // Sin esto la excepcion escapa al puente nativo y mata la app en Release.
       this.bytesInFlight -= next.length;
       this.writing = false;
-      this.pump();
-    });
+      this.close();
+    }
   }
 
   private takeFrame(): Uint8Array | null {

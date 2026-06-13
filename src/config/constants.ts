@@ -20,6 +20,9 @@ export const RECORDING_DEFAULTS = {
 export const STATS_INTERVAL_MS = 2000;
 export const FILE_CHUNK_SIZE = 1024 * 1024; // 1 MiB (limite del protocolo)
 export const MAX_BYTES_IN_FLIGHT = 1_500_000; // backpressure: drop de FRAMEs por encima
+// Tope de reintentos de entrega de un mismo archivo: rompe cualquier bucle de
+// reconexion/reenvio (el contador se persiste ANTES de cada intento).
+export const MAX_DELIVER_ATTEMPTS = 5;
 
 export const STORAGE_KEYS = {
   pin: 'vc.pin',
